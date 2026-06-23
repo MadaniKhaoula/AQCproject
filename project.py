@@ -1,33 +1,135 @@
 """
+=====================================================================
+AiQC Q-Day MiniHackathon — Variational Quantum Optimization Challenge
+Abstraction Bucket: WEIGHTED MAX-CUT
+Use case        : Data-Center Server Partitioning
+=====================================================================
 
-Install:
-    pip install pennylane qiskit qiskit-aer scipy matplotlib numpy networkx pylatexenc
+PROBLEM
+-------
+We have 5 servers (S1..S5). Each pair of servers that talks to each
+other has a "data traffic weight" (GB/s) on the edge between them.
+We want to split the servers into TWO groups (e.g. two racks / two
+availability zones) such that the total cross-group traffic is
+MAXIMIZED. Why maximize instead of minimize? In this toy scenario,
+high cross-link traffic represents load we want spread across two
+independent network spines for redundancy/throughput -- a "weighted
+max-cut" framing of the load-balancing problem (this is the standard
+benchmark form of weighted Max-Cut, chosen for clarity).
+
+-----------------------------------------------------------------
+1) QUBO FORMULATION
+-----------------------------------------------------------------
+Let x_i in {0,1} indicate which group server i is placed in.
+For an edge (i, j) with weight w_ij, the edge is CUT (servers in
+different groups) exactly when x_i != x_j. We can write this with
+the identity:
+
+        cut(i,j) = x_i + x_j - 2*x_i*x_j        (1 if cut, 0 if not)
+
+So the objective to MAXIMIZE is:
+
+        E(x) = sum_{(i,j) in Edges} w_ij * (x_i + x_j - 2*x_i*x_j)
+
+Expanding, this is already in QUBO form  E(x) = sum_i Q_ii x_i
++ sum_{i<j} Q_ij x_i x_j  with:
+
+        Q_ii  = sum_{j: (i,j) in E} w_ij     (linear / diagonal terms)
+        Q_ij  = -2 * w_ij                    (quadratic coupling terms)
+
+Since the problem is UNCONSTRAINED (any split of servers into two
+groups is valid -- there's no "budget" or cardinality constraint),
+no penalty terms are required. This is what makes Max-Cut one of the
+cleanest QUBO-native problems.
+
+-----------------------------------------------------------------
+2) ISING MAPPING
+-----------------------------------------------------------------
+Quantum hardware naturally evaluates Pauli-Z operators (eigenvalues
++1 / -1), not binary 0/1 variables. We substitute:
+
+        x_i = (1 - Z_i) / 2        where Z_i in {+1, -1}
+
+Substituting into cut(i,j) = x_i + x_j - 2*x_i*x_j and simplifying,
+the +1/-1 cross terms collapse into a beautifully simple form:
+
+        cut(i,j)  =  (1 - Z_i*Z_j) / 2
+
+So the cost Hamiltonian we actually diagonalize on the quantum
+computer is:
+
+    H_C = sum_{(i,j) in E} w_ij * (1 - Z_i Z_j) / 2
+
+The constant term (sum w_ij / 2) just shifts the energy and doesn't
+affect *where* the optimum is, so for variational optimization we
+only need to minimize the operative piece:
+
+    H_C' = -sum_{(i,j) in E} w_ij * Z_i Z_j      (minimizing H_C'
+                                                    maximizes the cut)
+
+This is exactly the operator built in code below (see
+`weighted_edges` -> `qp.Z(w1) @ qp.Z(w2)` for QAOA, and the
+`SparsePauliOp` ZZ terms for VQE/Qiskit).
+
+-----------------------------------------------------------------
+3) QAOA MECHANICS (PennyLane)
+-----------------------------------------------------------------
+QAOA alternates two problem-aware unitaries, p times ("p layers"):
+  - Cost unitary   U_C(gamma) = exp(-i*gamma*H_C')   encodes the
+    graph structure directly: a CNOT-RZ-CNOT motif per edge applies
+    a phase proportional to w_ij*gamma whenever two connected qubits
+    disagree.
+  - Mixer unitary  U_B(beta)  = exp(-i*beta*sum_i X_i)  is a simple
+    bank of RX rotations that lets amplitude flow between bitstrings,
+    so the optimizer can explore the solution space.
+Both layers are interleaved starting from an equal superposition
+(Hadamard on every wire), and (gamma, beta) are tuned classically to
+minimize <H_C'>.
+
+-----------------------------------------------------------------
+4) VQE MECHANICS (Qiskit) -- THE COMPARATIVE PIECE
+-----------------------------------------------------------------
+VQE solves the *exact same* Hamiltonian H_C' but swaps QAOA's
+graph-aware circuit for a generic, "hardware-efficient" Ansatz
+(here: RealAmplitudes, all real-amplitude RY rotations + linear
+CNOT entanglers) that has NO knowledge of which edges exist in the
+graph. The classical optimizer (COBYLA) only ever sees expectation
+values <H_C'> from the Estimator primitive and tunes the Ansatz's
+rotation angles blindly.
+
+KEY ARCHITECTURAL DIFFERENCE (this is what the slide deck should
+emphasize):
+  - QAOA's circuit is DERIVED from the problem (cost unitary is
+    literally built from the graph's edges/weights) -> fewer, more
+    targeted parameters, but a fixed/limited circuit family.
+  - VQE's circuit is PROBLEM-AGNOSTIC (same Ansatz would be used for
+    any 5-qubit Hamiltonian) -> more general / more expressive in
+    principle, but has to "discover" the problem structure purely
+    through optimization, with no built-in physical intuition about
+    the graph.
+=====================================================================
 """
 
-import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # safe for headless / script execution
+
+import pennylane as qp
+from pennylane import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import networkx as nx
-from scipy.optimize import minimize
+import rustworkx as rx
+from rustworkx.visualization import mpl_draw
 
-import pennylane as qml
-from pennylane import qaoa
+# Fix the random number generator so we get the same results every run
+np.random.seed(42)
 
-from qiskit.quantum_info import SparsePauliOp, Statevector
-from qiskit.circuit.library import real_amplitudes
+# ---------------------------------------------------------------
+# DATASET (toy, as required: 5 nodes / 6 weighted edges)
+# ---------------------------------------------------------------
+n_wires = 5
 
-print("=" * 70)
-print("  QAOA (PennyLane) + VQE (Qiskit) — Server Cluster Partitioning")
-print("=" * 70)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — PROBLEM DEFINITION
-# ─────────────────────────────────────────────────────────────────────────────
-
-n_qubits = 5
-
+graph = rx.PyGraph()
+graph.add_nodes_from(range(1, n_wires + 1))  # node PAYLOADS are 1..5 (S1..S5)
+# Define the connections between servers and the data traffic weight between them
 weighted_edges = [
     (0, 1, 3),
     (1, 2, 2),
@@ -37,485 +139,387 @@ weighted_edges = [
     (1, 4, 3),
 ]
 
-edges   = [(i, j) for i, j, _ in weighted_edges]
-weights = {(i, j): w for i, j, w in weighted_edges}
-positions = {0:(0,0), 1:(2,0), 2:(4,0), 3:(1,2), 4:(3,2)}
-labels    = {i: f"S{i+1}" for i in range(n_qubits)}
-total_weight = sum(w for _, _, w in weighted_edges)
+graph.add_edges_from(weighted_edges)
+pos = rx.spring_layout(graph, seed=2)
 
-print("\n[STEP 1] Problem Definition")
-print(f"  Servers  : {n_qubits}  (S1 – S5)")
-print(f"  Edges    : {len(weighted_edges)}  data-exchange pairs")
-print(f"  Max possible cut weight : {total_weight} GB/s")
-for i, j, w in weighted_edges:
-    print(f"    S{i+1}—S{j+1}  {w} GB/s")
+# NOTE: rustworkx node *indices* are 0..4, but each node's *payload* is
+# already 1..5 (set above), so labels should use the payload directly
+# (f"S{x}") rather than the index (f"S{x+1}", which mislabels S1 as "S2").
+def server_label(payload):
+    return f"S{payload}"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — QUBO FORMULATION
-# ─────────────────────────────────────────────────────────────────────────────
 
-Q = np.zeros((n_qubits, n_qubits))
-for i, j, w in weighted_edges:
-    Q[i][i] -= w
-    Q[j][j] -= w
-    Q[i][j] += 2 * w
+# =================================================================
+# QUANTUM CIRCUITS — QAOA (PennyLane)
+# =================================================================
 
-print("\n[STEP 2] QUBO Matrix  Q  (E(x) = xᵀQx)")
-header = "       " + "".join(f"  S{k+1} " for k in range(n_qubits))
-print(header)
-for i in range(n_qubits):
-    row = f"  S{i+1}  " + "".join(f"{Q[i][k]:+5.0f} " for k in range(n_qubits))
-    print(row)
+# Cost Hamiltonian H_C' = -sum w_ij Z_i Z_j  (see derivation above)
+def U_B(beta):
+    """Mixer layer: rotates every qubit to spread amplitude across bitstrings."""
+    for wire in range(n_wires):
+        qp.RX(2 * beta, wires=wire)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — ISING HAMILTONIAN
-# ─────────────────────────────────────────────────────────────────────────────
 
-J_coupling = {(i, j): w / 2.0 for i, j, w in weighted_edges}
+def U_C(gamma):
+    """Cost layer: encodes the weighted graph directly into a phase per edge."""
+    for w1, w2, weight in weighted_edges:
+        qp.CNOT(wires=[w1, w2])
+        qp.RZ(weight * gamma, wires=w2)
+        qp.CNOT(wires=[w1, w2])
 
-h_field = np.zeros(n_qubits)
-for i in range(n_qubits):
-    h_field[i] = 0.5 * Q[i][i]
-    for j in range(n_qubits):
-        if j != i:
-            h_field[i] += 0.25 * Q[i][j] if i < j else 0.25 * Q[j][i]
 
-print("\n[STEP 3] Ising Hamiltonian Coefficients")
-print("  Linear fields  hᵢ  (Zᵢ terms):")
-for q in range(n_qubits):
-    print(f"    h[S{q+1}] = {h_field[q]:+.4f}")
-print("  Couplings  Jᵢⱼ  (ZᵢZⱼ terms):")
-for (i, j), Jval in J_coupling.items():
-    print(f"    J[S{i+1},S{j+1}] = {Jval:+.4f}   (from {weights[(i,j)]} GB/s edge)")
+def bitstring_to_int(bit_string_sample):
+    """Convert a binary outcome (e.g. [0,1,0,1,0]) into an integer."""
+    return int(2 ** np.arange(len(bit_string_sample)) @ bit_string_sample[::-1])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER — brute-force
-# ─────────────────────────────────────────────────────────────────────────────
 
-def cut_weight(bitstring):
-    x = [int(b) for b in bitstring]
-    return sum(w * abs(x[i] - x[j]) for i, j, w in weighted_edges)
+dev = qp.device("lightning.qubit", wires=n_wires)
 
-def ising_energy(bitstring):
-    z = [1 - 2 * int(b) for b in bitstring]
-    e  = sum(h_field[q] * z[q] for q in range(n_qubits))
-    e += sum(J_coupling[(i,j)] * z[i] * z[j] for i, j, _ in weighted_edges)
-    return e
 
-def brute_force():
-    best_e, best_s = float("inf"), ""
-    for bits in range(2 ** n_qubits):
-        s = format(bits, f"0{n_qubits}b")
-        e = ising_energy(s)
-        if e < best_e:
-            best_e, best_s = e, s
-    return best_s, best_e
+@qp.set_shots(20)  # 20 samples per optimization step
+@qp.qnode(dev)
+def circuit(gammas, betas, return_samples=False):
+    # Step 1: equal superposition over all 2^5 server-partitions
+    for wire in range(n_wires):
+        qp.Hadamard(wires=wire)
 
-bf_string, bf_energy = brute_force()
-bf_cut    = cut_weight(bf_string)
-bf_clusterA = [f"S{i+1}" for i, b in enumerate(bf_string) if b == "1"]
-bf_clusterB = [f"S{i+1}" for i, b in enumerate(bf_string) if b == "0"]
+    # Step 2: alternate cost & mixer layers, p times
+    for gamma, beta in zip(gammas, betas):
+        U_C(gamma)
+        U_B(beta)
 
-print("\n[BRUTE FORCE REFERENCE]")
-print(f"  Best bitstring : |{bf_string}⟩")
-print(f"  Cluster A (1)  : {bf_clusterA}")
-print(f"  Cluster B (0)  : {bf_clusterB}")
-print(f"  Cut weight     : {bf_cut:.0f} GB/s  out of {total_weight} GB/s total")
-print(f"  Ising energy   : {bf_energy:.4f}")
+    if return_samples:
+        return qp.sample()
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  PART A — QAOA via PennyLane
-# ═════════════════════════════════════════════════════════════════════════════
+    # H_C (un-shifted form, includes the "+w_ij" so larger = better cut)
+    C = qp.sum(*(weight * (qp.Z(w1) @ qp.Z(w2)) for w1, w2, weight in weighted_edges))
+    return qp.expval(C)
 
-print("\n" + "=" * 70)
-print("  PART A — QAOA  (PennyLane)")
-print("=" * 70)
 
-cost_coeffs, cost_ops = [], []
-for q in range(n_qubits):
-    cost_coeffs.append(float(h_field[q]))
-    cost_ops.append(qml.PauliZ(q))
-for (i, j), Jval in J_coupling.items():
-    cost_coeffs.append(float(Jval))
-    cost_ops.append(qml.PauliZ(i) @ qml.PauliZ(j))
+def objective(params):
+    """Negative cut weight (PennyLane optimizers minimize, so we negate to maximize the cut)."""
+    total_weight = sum(w for _, _, w in weighted_edges)
+    return -0.5 * (total_weight - circuit(*params))
 
-cost_hamiltonian  = qml.Hamiltonian(cost_coeffs, cost_ops)
-mixer_hamiltonian = qml.Hamiltonian(
-    [-1.0] * n_qubits,
-    [qml.PauliX(q) for q in range(n_qubits)]
+
+qaoa_history = []
+
+
+def qaoa_maxcut(n_layers=2):
+    print(f"\nRunning QAOA with p={n_layers:d} layers")
+
+    init_params = 0.01 * np.random.rand(2, n_layers, requires_grad=True)
+    opt = qp.AdagradOptimizer(stepsize=0.1)
+
+    params = init_params.copy()
+    steps = 500
+
+    for i in range(steps):
+        params = opt.step(objective, params)
+        current_energy = circuit(*params)
+        qaoa_history.append(current_energy)
+
+        if (i + 1) % 50 == 0:
+            print(f"Objective after step {i + 1:3d}: {-objective(params): .7f}")
+
+    # Final measurement: sample the optimized circuit to find the most likely partition
+    bitstrings = qp.set_shots(circuit, shots=100)(*params, return_samples=True)
+    sampled_ints = [bitstring_to_int(string) for string in bitstrings]
+
+    counts = np.bincount(np.array(sampled_ints), minlength=2 ** n_wires)
+    most_freq_bit_string = np.argmax(counts)
+
+    print(f"Optimized Angles:\ngamma: {params[0]}\nbeta:  {params[1]}")
+    print(f"The best server group partition is: {most_freq_bit_string:05b}")
+
+    return -objective(params), sampled_ints, most_freq_bit_string
+
+
+qaoa_best_cut, int_samples2, qaoa_best_int = qaoa_maxcut(n_layers=2)
+
+
+# =================================================================
+# QUANTUM CIRCUITS — VQE (Qiskit) — comparative algorithm
+# =================================================================
+print("\n" + "=" * 40)
+print("Starting VQE Part using Qiskit 2.0+")
+print("=" * 40)
+
+from qiskit.circuit.library import real_amplitudes
+from qiskit.quantum_info import SparsePauliOp
+from qiskit_aer.primitives import EstimatorV2 as AerEstimator
+from qiskit_aer.primitives import SamplerV2 as AerSampler
+from scipy.optimize import minimize
+
+# Build the same Ising cost Hamiltonian H_C' = -sum w_ij Z_i Z_j
+# (sign convention: SparsePauliOp coefficients carry +w_ij, and VQE
+#  minimizes <H>, which is equivalent to maximizing the cut -- same
+#  physics as the QAOA `objective` above, just expressed via Qiskit's
+#  operator algebra instead of PennyLane's.)
+pauli_list = []
+for w1, w2, weight in weighted_edges:
+    pauli_str = ["I"] * n_wires
+    pauli_str[w1] = "Z"
+    pauli_str[w2] = "Z"
+    pauli_list.append(("".join(reversed(pauli_str)), weight))
+
+qiskit_hamiltonian = SparsePauliOp.from_list(pauli_list)
+
+# Problem-agnostic hardware-efficient Ansatz (no graph knowledge baked in)
+vqe_ansatz = real_amplitudes(num_qubits=n_wires, entanglement="linear", reps=1)
+vqe_ansatz = vqe_ansatz.decompose()
+
+estimator = AerEstimator()
+vqe_history = []
+
+
+def vqe_objective_qiskit(params):
+    job = estimator.run([(vqe_ansatz, qiskit_hamiltonian, params)])
+    result = job.result()[0]
+    return float(result.data.evs)
+
+
+num_params = vqe_ansatz.num_parameters
+init_vqe_params = 0.01 * np.random.rand(num_params)
+
+print(f"Optimizing VQE with {num_params} parameters...")
+
+
+def callback_fn(xk):
+    current_energy = vqe_objective_qiskit(xk)
+    vqe_history.append(current_energy)
+
+
+res = minimize(
+    vqe_objective_qiskit,
+    init_vqe_params,
+    method="COBYLA",
+    callback=callback_fn,
+    options={"maxiter": 380},
 )
 
-print("\n[A1] Cost Hamiltonian built  —  Weighted Max-Cut on server graph")
-print(f"     Terms: {len(cost_coeffs)}  ({n_qubits} linear + {len(J_coupling)} ZZ couplings)")
+print("\nOptimization Finished!")
 
-p = 5
-dev_qaoa = qml.device("default.qubit", wires=n_qubits)
+optimized_vqe_circuit = vqe_ansatz.assign_parameters(res.x)
+optimized_vqe_circuit.measure_all()
 
-@qml.qnode(dev_qaoa)
-def qaoa_circuit(params):
-    gammas, betas = params[0], params[1]
-    for q in range(n_qubits):
-        qml.Hadamard(wires=q)
-    for layer in range(p):
-        qaoa.cost_layer(gammas[layer], cost_hamiltonian)
-        qaoa.mixer_layer(betas[layer], mixer_hamiltonian)
-    return qml.expval(cost_hamiltonian)
+sampler = AerSampler()
+sampler_job = sampler.run([optimized_vqe_circuit], shots=100)
+vqe_counts = sampler_job.result()[0].data.meas.get_counts()
 
-print(f"[A2] QAOA circuit: {p} layers, {2*p} parameters total")
-print("[A3] Optimising with COBYLA …")
+best_vqe_bitstring = max(vqe_counts, key=vqe_counts.get)
+print(f"VQE Best server group partition is: {best_vqe_bitstring}")
 
-qaoa_energy_history = []
+# Cut weight achieved by the VQE solution (computed classically, for the title)
+def cut_weight(bitstring_msb_first):
+    # bitstring is Qiskit-ordered (qubit 4 ... qubit 0); convert to our x_i convention
+    bits = [int(b) for b in bitstring_msb_first[::-1]]  # bits[i] = value of server i
+    return sum(w for (i, j, w) in weighted_edges if bits[i] != bits[j])
 
-def qaoa_cost(flat_params):
-    e = float(qaoa_circuit(flat_params.reshape(2, p)))
-    qaoa_energy_history.append(e)
-    return e
 
-rng = np.random.default_rng(42)
-init_qaoa = rng.uniform(0, np.pi, size=2 * p)
-
-res_qaoa = minimize(qaoa_cost, init_qaoa, method="COBYLA",
-                    options={"maxiter": 500, "rhobeg": 0.5})
-
-best_params_qaoa = res_qaoa.x.reshape(2, p)
-print(f"  Optimised γ = {best_params_qaoa[0].round(4)}")
-print(f"  Optimised β = {best_params_qaoa[1].round(4)}")
-print(f"  Minimum ⟨Ĥ⟩  = {res_qaoa.fun:.4f}")
-
-@qml.qnode(qml.device("default.qubit", wires=n_qubits))
-def qaoa_statevector(params):
-    gammas, betas = params[0], params[1]
-    for q in range(n_qubits):
-        qml.Hadamard(wires=q)
-    for layer in range(p):
-        qaoa.cost_layer(gammas[layer], cost_hamiltonian)
-        qaoa.mixer_layer(betas[layer], mixer_hamiltonian)
-    return qml.state()
-
-sv_qaoa = np.array(qaoa_statevector(best_params_qaoa))
-probs_qaoa = np.abs(sv_qaoa) ** 2
-qaoa_probs_dict = {format(idx, f"0{n_qubits}b"): float(pr)
-                   for idx, pr in enumerate(probs_qaoa)}
-
-qaoa_answer   = max(qaoa_probs_dict, key=qaoa_probs_dict.get)
-qaoa_clusterA = [f"S{i+1}" for i, b in enumerate(qaoa_answer) if b == "1"]
-qaoa_clusterB = [f"S{i+1}" for i, b in enumerate(qaoa_answer) if b == "0"]
-
-print("\n[A4] QAOA Result")
-print(f"  Top bitstring  : |{qaoa_answer}⟩  (prob = {qaoa_probs_dict[qaoa_answer]:.4f})")
-print(f"  Cluster A (1)  : {qaoa_clusterA}")
-print(f"  Cluster B (0)  : {qaoa_clusterB}")
-print(f"  Cut weight     : {cut_weight(qaoa_answer):.0f} GB/s")
-print(f"  Ising energy   : {ising_energy(qaoa_answer):.4f}")
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PART B — VQE via Qiskit
-# ═════════════════════════════════════════════════════════════════════════════
-
-print("\n" + "=" * 70)
-print("  PART B — VQE  (Qiskit)")
-print("=" * 70)
-
-def pauli_z(qubit, n):
-    s = ["I"] * n
-    s[n - 1 - qubit] = "Z"
-    return "".join(s)
-
-def pauli_zz(qi, qj, n):
-    s = ["I"] * n
-    s[n - 1 - qi] = "Z"
-    s[n - 1 - qj] = "Z"
-    return "".join(s)
-
-pauli_list = (
-    [(pauli_z(q, n_qubits), float(h_field[q])) for q in range(n_qubits)] +
-    [(pauli_zz(i, j, n_qubits), float(Jval))   for (i,j), Jval in J_coupling.items()]
+qaoa_bitstring = f"{qaoa_best_int:05b}"
+qaoa_cut = sum(
+    w for (i, j, w) in weighted_edges if qaoa_bitstring[::-1][i] != qaoa_bitstring[::-1][j]
 )
+vqe_cut = cut_weight(best_vqe_bitstring)
+optimal_cut = sum(w for _, _, w in weighted_edges) / 2 + max(
+    0, sum(w for _, _, w in weighted_edges) / 2
+)
+# (Brute-force the true optimum for an honest reference line on the convergence plots)
+best_brute_cut = 0
+optimal_int = 0
+for k in range(2 ** n_wires):
+    bits = [(k >> b) & 1 for b in range(n_wires)]
+    c = sum(w for (i, j, w) in weighted_edges if bits[i] != bits[j])
+    if c > best_brute_cut:
+        best_brute_cut = c
+        optimal_int = k
+optimal_energy = -best_brute_cut  # H_C' minimum = -(max cut weight)
 
-hamiltonian_qiskit = SparsePauliOp.from_list(pauli_list)
+print(f"\nBrute-force optimal cut weight: {best_brute_cut} GB/s")
+print(f"QAOA achieved cut weight:        {qaoa_cut} GB/s")
+print(f"VQE achieved cut weight:         {vqe_cut} GB/s")
 
-print("\n[B1] Qiskit Hamiltonian (SparsePauliOp):")
-for term, coeff in pauli_list:
-    print(f"  {coeff:+.4f} · {term}")
 
-reps_vqe = 2
-ansatz   = real_amplitudes(num_qubits=n_qubits, reps=reps_vqe)
+# =====================================================================
+# FIGURE 1 — "BEFORE vs AFTER" (required hackathon deliverable):
+# unpartitioned network next to both quantum solutions, side by side.
+# =====================================================================
+plt.style.use("dark_background")
 
-print(f"\n[B2] Ansatz: real_amplitudes | reps={reps_vqe} | "
-      f"parameters={ansatz.num_parameters}")
 
-vqe_energy_history = []
-
-def vqe_energy(params):
-    bound = ansatz.assign_parameters(params)
-    sv    = Statevector(bound)
-    e     = sv.expectation_value(hamiltonian_qiskit).real
-    vqe_energy_history.append(float(e))
-    return float(e)
-
-print("[B3] Optimising with L-BFGS-B …")
-init_vqe = rng.uniform(0, np.pi, size=ansatz.num_parameters)
-res_vqe  = minimize(vqe_energy, init_vqe, method="L-BFGS-B",
-                    options={"maxiter": 1000, "ftol": 1e-9})
-print(f"  Minimum ⟨Ĥ⟩  = {res_vqe.fun:.4f}")
-
-bound_final = ansatz.assign_parameters(res_vqe.x)
-sv_final    = Statevector(bound_final)
-probs_vqe   = sv_final.probabilities()
-vqe_probs_dict = {format(idx, f"0{n_qubits}b"): float(pr)
-                  for idx, pr in enumerate(probs_vqe)}
-
-vqe_answer   = max(vqe_probs_dict, key=vqe_probs_dict.get)
-vqe_clusterA = [f"S{i+1}" for i, b in enumerate(vqe_answer) if b == "1"]
-vqe_clusterB = [f"S{i+1}" for i, b in enumerate(vqe_answer) if b == "0"]
-
-print("\n[B4] VQE Result")
-print(f"  Top bitstring  : |{vqe_answer}⟩  (prob = {vqe_probs_dict[vqe_answer]:.4f})")
-print(f"  Cluster A (1)  : {vqe_clusterA}")
-print(f"  Cluster B (0)  : {vqe_clusterB}")
-print(f"  Cut weight     : {cut_weight(vqe_answer):.0f} GB/s")
-print(f"  Ising energy   : {ising_energy(vqe_answer):.4f}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — FINAL COMPARISON
-# ─────────────────────────────────────────────────────────────────────────────
-
-print("\n" + "=" * 70)
-print("  FINAL COMPARISON")
-print("=" * 70)
-print(f"  {'Method':<22} {'Bitstring':<12} {'Cut (GB/s)':<12} {'Energy':>8}")
-print(f"  {'-'*22} {'-'*12} {'-'*12} {'-'*8}")
-print(f"  {'Brute Force':<22} |{bf_string}⟩    {bf_cut:<12.0f} {bf_energy:>8.4f}")
-print(f"  {'QAOA (PennyLane)':<22} |{qaoa_answer}⟩    {cut_weight(qaoa_answer):<12.0f} {ising_energy(qaoa_answer):>8.4f}")
-print(f"  {'VQE  (Qiskit)':<22} |{vqe_answer}⟩    {cut_weight(vqe_answer):<12.0f} {ising_energy(vqe_answer):>8.4f}")
-
-print(f"\n  QAOA matched optimal? {'YES ✓' if ising_energy(qaoa_answer) <= bf_energy+1e-6 else 'NO — sub-optimal'}")
-print(f"  VQE  matched optimal? {'YES ✓' if ising_energy(vqe_answer)  <= bf_energy+1e-6 else 'NO — sub-optimal'}")
-print(f"\n  Architectural difference:")
-print(f"    QAOA : circuit tailored to the server graph  ({2*p} params)")
-print(f"    VQE  : generic RealAmplitudes ansatz         ({ansatz.num_parameters} params)")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 — VISUALISATIONS  (3 rows: circuits, graphs, convergence+probs)
-# ─────────────────────────────────────────────────────────────────────────────
-
-print("\n[PLOT] Generating figure …")
-
-DARK  = "#0d1117"; PANEL = "#161b22"; GRID  = "#21262d"
-WHITE = "#e6edf3"; MUTED = "#8b949e"
-CYAN  = "#00e5ff"; AMBER = "#ffab40"; GREEN = "#69ff47"
-RED   = "#ff6b6b"
-
-# ── PRE-RENDER the two circuit figures ───────────────────────────────────────
-
-# --- QAOA circuit: use p=2 for a clean readable diagram ---
-p_display = 2
-dev_display = qml.device("default.qubit", wires=n_qubits)
-
-@qml.qnode(dev_display)
-def qaoa_display_circuit(params):
+def draw_server_graph(ax, node_color, **extra_kwargs):
     """
-    Compact QAOA circuit for display only (p=2 layers).
-    Shows: Hadamard init → [cost layer | mixer layer] × 2
+    Thin wrapper around rustworkx's mpl_draw with two fixes for this
+    dark-themed dashboard:
+      1) mpl_draw() unconditionally calls fig.set_facecolor("w") every
+         time it runs, which silently overwrites the dark_background
+         style. We restore the dark facecolor on both the figure and
+         this axes right after drawing.
+      2) mpl_draw()'s default edge_color is black, which is invisible
+         against a black background, so we explicitly pass a visible
+         light-gray edge color (overridable via extra_kwargs).
     """
-    gammas, betas = params[0], params[1]
-    for q in range(n_qubits):
-        qml.Hadamard(wires=q)
-    for layer in range(p_display):
-        qaoa.cost_layer(gammas[layer], cost_hamiltonian)
-        qaoa.mixer_layer(betas[layer], mixer_hamiltonian)
-    return qml.expval(cost_hamiltonian)
+    edge_color = extra_kwargs.pop("edge_color", "#9aa0a6")
+    font_color = extra_kwargs.pop("font_color", "white")
+    mpl_draw(
+        graph,
+        pos=pos,
+        ax=ax,
+        with_labels=True,
+        labels=server_label,
+        node_color=node_color,
+        edge_color=edge_color,
+        font_color=font_color,
+        **extra_kwargs,
+    )
+    ax.get_figure().set_facecolor("black")
+    ax.set_facecolor("black")
 
-dummy_params = np.zeros((2, p_display))
-fig_qaoa_circ, ax_qaoa_circ = qml.draw_mpl(
-    qaoa_display_circuit,
-    decimals=2,
-    style="pennylane"
-)(dummy_params)
 
-# Style the PennyLane circuit figure to match dark theme
-fig_qaoa_circ.patch.set_facecolor(PANEL)
-ax_qaoa_circ.set_facecolor(PANEL)
-fig_qaoa_circ.savefig("/tmp/qaoa_circuit.png", dpi=150,
-                      bbox_inches="tight", facecolor=PANEL)
-plt.close(fig_qaoa_circ)
-
-# --- VQE circuit (RealAmplitudes, decomposed so gates are visible) ---
-ansatz_display = RealAmplitudes(num_qubits=n_qubits, reps=reps_vqe,
-                                 parameter_prefix="θ")
-ansatz_decomposed = ansatz_display.decompose()
-
-fig_vqe_circ = ansatz_decomposed.draw(
-    output="mpl",
-    style={
-        "backgroundcolor": PANEL,
-        "textcolor":       WHITE,
-        "gatetextcolor":   "#0d1117",
-        "subtextcolor":    MUTED,
-        "linecolor":       MUTED,
-        "creglinecolor":   MUTED,
-        "gatefacecolor":   AMBER,
-        "controllinecolor": AMBER,
-        "barrierfacecolor": GRID,
-        "gate_length":     1.2,
-    },
-    fold=20,
-    plot_barriers=False,
-)
-fig_vqe_circ.patch.set_facecolor(PANEL)
-fig_vqe_circ.savefig("/tmp/vqe_circuit.png", dpi=150,
-                     bbox_inches="tight", facecolor=PANEL)
-plt.close(fig_vqe_circ)
-
-print("  Circuit images rendered.")
-
-# ── MAIN FIGURE: 3 rows × 3 cols ─────────────────────────────────────────────
-#   Row 0: QAOA circuit | (spacer) | VQE circuit
-#   Row 1: unpartitioned graph | QAOA solution | VQE solution
-#   Row 2: QAOA convergence  | VQE convergence | probability histogram
-
-fig = plt.figure(figsize=(22, 18))
-fig.patch.set_facecolor(DARK)
-gs = gridspec.GridSpec(
-    3, 3, figure=fig,
-    hspace=0.52, wspace=0.35,
-    height_ratios=[1.1, 1.0, 1.0]   # circuits row slightly taller
+fig1, axs1 = plt.subplots(1, 3, figsize=(18, 6))
+fig1.suptitle(
+    "Before vs After: Quantum-Optimized Server Partitioning\n"
+    "Weighted Max-Cut • 5 Servers • 6 Data-Exchange Links",
+    fontsize=15,
+    fontweight="bold",
 )
 
-# ── Row 0: circuit panels ─────────────────────────────────────────────────────
+# --- BEFORE: unpartitioned network ---
+axs1[0].set_title("BEFORE\nServer Network (unpartitioned)", fontsize=12, pad=12)
+colors_init = ["#6c757d"] * n_wires
+draw_server_graph(
+    axs1[0],
+    colors_init,
+    node_size=900,
+    width=[w for _, _, w in weighted_edges],
+)
 
-def circuit_panel(ax, img_path, title, accent_color):
-    """Embed a saved circuit PNG into a matplotlib axis."""
-    ax.set_facecolor(PANEL)
-    ax.set_title(title, color=accent_color, fontsize=10,
-                 fontweight="bold", pad=8)
-    img = plt.imread(img_path)
-    ax.imshow(img, aspect="auto", interpolation="lanczos")
-    ax.axis("off")
-    # decorative border
-    for spine in ax.spines.values():
-        spine.set_edgecolor(accent_color)
-        spine.set_linewidth(1.2)
-        spine.set_visible(True)
+# --- AFTER: QAOA solution ---
+axs1[1].set_title(
+    f"AFTER (QAOA)\n|{qaoa_bitstring}⟩  cut = {qaoa_cut} GB/s", fontsize=12, pad=12
+)
+colors_qaoa = ["#00f5ff" if c == "1" else "#ff5a5a" for c in qaoa_bitstring]
+draw_server_graph(
+    axs1[1],
+    colors_qaoa,
+    node_size=900,
+    width=[w for _, _, w in weighted_edges],
+)
 
-ax_qc = fig.add_subplot(gs[0, :2])   # QAOA circuit spans 2 columns
-circuit_panel(ax_qc, "/tmp/qaoa_circuit.png",
-              f"QAOA Circuit  (p=2 display layers shown, {p} used in optimisation)\n"
-              f"H⊗5  →  [Cost unitary Uc(γ)  |  Mixer unitary Um(β)]  × p",
-              CYAN)
+# --- AFTER: VQE solution ---
+axs1[2].set_title(
+    f"AFTER (VQE)\n|{best_vqe_bitstring}⟩  cut = {vqe_cut} GB/s", fontsize=12, pad=12
+)
+colors_vqe = ["#00f5ff" if c == "1" else "#ff5a5a" for c in best_vqe_bitstring]
+draw_server_graph(
+    axs1[2],
+    colors_vqe,
+    node_size=900,
+    width=[w for _, _, w in weighted_edges],
+)
 
-ax_vc = fig.add_subplot(gs[0, 2])    # VQE circuit in 3rd column
-circuit_panel(ax_vc, "/tmp/vqe_circuit.png",
-              f"VQE Ansatz — RealAmplitudes (reps={reps_vqe})\n"
-              f"Ry(θ) rotations  +  CX entanglement  |  {ansatz.num_parameters} params",
-              AMBER)
+plt.tight_layout(rect=[0, 0.03, 1, 0.90])
+plt.savefig("before_after.png", dpi=150, facecolor=fig1.get_facecolor())
+print("\nSaved: before_after.png")
 
-# ── Row 1: graph panels ───────────────────────────────────────────────────────
 
-def draw_server_graph(ax, bits, title, clusterA_color, clusterB_color):
-    ax.set_facecolor(PANEL)
-    ax.set_title(title, color=WHITE, fontsize=10, pad=8, fontweight="bold")
-    for i, j, w in weighted_edges:
-        xi, yi = positions[i]; xj, yj = positions[j]
-        is_cut = (int(bits[i]) != int(bits[j]))
-        lw    = 1.0 + w * 0.8
-        color = GREEN if is_cut else MUTED
-        alpha = 0.95 if is_cut else 0.35
-        ax.plot([xi, xj], [yi, yj], color=color, lw=lw, zorder=1, alpha=alpha)
-        mx, my = (xi+xj)/2, (yi+yj)/2
-        ax.text(mx, my+0.12, f"{w}GB/s", ha="center", va="bottom",
-                fontsize=6.5, color=GREEN if is_cut else MUTED, zorder=5)
-    for q in range(n_qubits):
-        x, y = positions[q]
-        in_A  = bits[q] == "1"
-        color = clusterA_color if in_A else clusterB_color
-        ax.scatter(x, y, s=700, c=color, edgecolors=WHITE,
-                   linewidths=1.8, zorder=3)
-        ax.text(x, y, f"S{q+1}", ha="center", va="center",
-                fontsize=9, fontweight="bold", color=DARK, zorder=4)
-        ax.text(x, y-0.28, "A" if in_A else "B", ha="center", va="top",
-                fontsize=7, color=color, zorder=4)
-    ax.set_xlim(-0.8, 4.8); ax.set_ylim(-0.8, 2.8); ax.axis("off")
-
-ax0 = fig.add_subplot(gs[1, 0])
-draw_server_graph(ax0, "00000", "Server Network\n(unpartitioned)", MUTED, MUTED)
-
-ax1 = fig.add_subplot(gs[1, 1])
-draw_server_graph(ax1, qaoa_answer,
-                  f"QAOA Solution  |{qaoa_answer}⟩\n"
-                  f"(PennyLane)  cut={cut_weight(qaoa_answer):.0f} GB/s",
-                  CYAN, RED)
-
-ax2 = fig.add_subplot(gs[1, 2])
-draw_server_graph(ax2, vqe_answer,
-                  f"VQE Solution   |{vqe_answer}⟩\n"
-                  f"(Qiskit)  cut={cut_weight(vqe_answer):.0f} GB/s",
-                  AMBER, RED)
-
-# ── Row 2: convergence + probability ─────────────────────────────────────────
-
-def style_ax(ax, title):
-    ax.set_facecolor(PANEL)
-    ax.set_title(title, color=WHITE, fontsize=10, fontweight="bold")
-    ax.tick_params(colors=MUTED, labelsize=8)
-    ax.set_xlabel("Iteration", color=MUTED, fontsize=8)
-    ax.set_ylabel("⟨Ĥ⟩", color=MUTED, fontsize=9)
-    for sp in ax.spines.values():
-        sp.set_edgecolor(GRID)
-
-ax3 = fig.add_subplot(gs[2, 0])
-ax3.plot(qaoa_energy_history, color=CYAN, lw=1.4, alpha=0.9)
-ax3.axhline(bf_energy, color=GREEN, lw=1.2, ls="--",
-            label=f"Optimal {bf_energy:.3f}")
-style_ax(ax3, "QAOA Convergence")
-ax3.legend(fontsize=8, facecolor=GRID, labelcolor=WHITE, edgecolor=MUTED)
-
-ax4 = fig.add_subplot(gs[2, 1])
-ax4.plot(vqe_energy_history, color=AMBER, lw=1.4, alpha=0.9)
-ax4.axhline(bf_energy, color=GREEN, lw=1.2, ls="--",
-            label=f"Optimal {bf_energy:.3f}")
-style_ax(ax4, "VQE Convergence")
-ax4.legend(fontsize=8, facecolor=GRID, labelcolor=WHITE, edgecolor=MUTED)
-
-ax5 = fig.add_subplot(gs[2, 2])
-ax5.set_facecolor(PANEL)
-
-top_n = 8
-qaoa_top = sorted(qaoa_probs_dict.items(), key=lambda x: -x[1])[:top_n]
-vqe_top  = sorted(vqe_probs_dict.items(),  key=lambda x: -x[1])[:top_n]
-all_labels = list(dict.fromkeys([k for k,_ in qaoa_top]+[k for k,_ in vqe_top]))[:top_n]
-
-x_pos = np.arange(len(all_labels)); bar_w = 0.38
-ax5.bar(x_pos - bar_w/2,
-        [qaoa_probs_dict.get(l, 0) for l in all_labels],
-        bar_w, color=CYAN,  alpha=0.85, label="QAOA")
-ax5.bar(x_pos + bar_w/2,
-        [vqe_probs_dict.get(l, 0)  for l in all_labels],
-        bar_w, color=AMBER, alpha=0.85, label="VQE")
-
-if bf_string in all_labels:
-    ax5.axvline(all_labels.index(bf_string), color=GREEN, lw=1.3,
-                ls="--", alpha=0.7, label=f"Optimal |{bf_string}⟩")
-
-ax5.set_xticks(x_pos)
-ax5.set_xticklabels(all_labels, rotation=45, ha="right", fontsize=7, color=MUTED)
-ax5.set_title("Probability Distribution\n(Top bitstrings)",
-              color=WHITE, fontsize=10, fontweight="bold")
-ax5.set_ylabel("Probability", color=MUTED, fontsize=8)
-ax5.tick_params(colors=MUTED)
-ax5.legend(fontsize=8, facecolor=GRID, labelcolor=WHITE, edgecolor=MUTED)
-for sp in ax5.spines.values():
-    sp.set_edgecolor(GRID)
-
+# =====================================================================
+# FIGURE 2 — Full 2x4 comparative dashboard (QAOA vs VQE)
+# =====================================================================
+fig, axs = plt.subplots(2, 4, figsize=(26, 14))
 fig.suptitle(
     "QAOA (PennyLane)  vs  VQE (Qiskit) — Data Center Server Partitioning\n"
-    "Weighted Max-Cut · 5 Servers · 6 Data-Exchange Links",
-    color=WHITE, fontsize=14, fontweight="bold", y=0.995
+    "Weighted Max-Cut • 5 Servers • 6 Data-Exchange Links",
+    fontsize=16,
+    fontweight="bold",
+    y=0.98,
 )
 
-out_img = "server_partition_results.png"
-plt.savefig(out_img, dpi=150, bbox_inches="tight", facecolor=DARK)
-print(f"  Figure saved → {out_img}")
-plt.close()
+# --- Row 1, Col 1: Server Network (unpartitioned) ---
+axs[0, 0].set_title("Server Network\n(unpartitioned)", fontsize=12, pad=15)
+draw_server_graph(axs[0, 0], colors_init, node_size=700)
 
-print("\n✅  All done!\n")
+# --- Row 1, Col 2: QAOA Partition Graph Solution ---
+axs[0, 1].set_title(
+    f"QAOA Solution  |{qaoa_bitstring}⟩\n(PennyLane)  cut={qaoa_cut} GB/s",
+    fontsize=12,
+    pad=15,
+)
+draw_server_graph(axs[0, 1], colors_qaoa, node_size=700)
+
+# --- Row 1, Col 3: VQE Partition Graph Solution ---
+axs[0, 2].set_title(
+    f"VQE Solution  |{best_vqe_bitstring}⟩\n(Qiskit)  cut={vqe_cut} GB/s",
+    fontsize=12,
+    pad=15,
+)
+draw_server_graph(axs[0, 2], colors_vqe, node_size=700)
+
+# --- Row 1, Col 4: unused (kept blank to balance the 2x4 grid) ---
+axs[0, 3].axis("off")
+
+# --- Row 2, Col 1: QAOA Optimization Curve ---
+axs[1, 0].set_title("QAOA Convergence", fontsize=12)
+axs[1, 0].plot(qaoa_history, color="#00f5ff", linewidth=2)
+axs[1, 0].axhline(
+    y=optimal_energy, color="#39ff14", linestyle="--", label=f"Optimal {optimal_energy:.3f}"
+)
+axs[1, 0].set_xlabel("Iteration")
+axs[1, 0].set_ylabel("⟨H⟩")
+axs[1, 0].legend()
+
+# --- Row 2, Col 2: VQE Optimization Curve ---
+axs[1, 1].set_title("VQE Convergence", fontsize=12)
+axs[1, 1].step(range(len(vqe_history)), vqe_history, color="#ff9f43", linewidth=2)
+axs[1, 1].axhline(
+    y=optimal_energy, color="#39ff14", linestyle="--", label=f"Optimal {optimal_energy:.3f}"
+)
+axs[1, 1].set_xlabel("Iteration")
+axs[1, 1].set_ylabel("⟨H⟩")
+axs[1, 1].legend()
+
+# --- Row 2, Col 3 & 4: Frequency Histograms (PennyLane-tutorial style) ---
+# Each panel shows ALL 32 possible bitstrings on the x-axis, with the raw
+# sample frequency (count out of 100 shots) on the y-axis. The optimal
+# bitstring is highlighted in green so the solution "pops" visually,
+# exactly like the official PennyLane QAOA MaxCut demo dashboards.
+
+qaoa_freqs = np.bincount(int_samples2, minlength=2 ** n_wires)
+vqe_freqs = np.zeros(2 ** n_wires, dtype=int)
+for bitstr, count in vqe_counts.items():
+    rev_bitstr = bitstr[::-1]
+    vqe_freqs[int(rev_bitstr, 2)] = count
+
+# True optimal bitstring (brute-forced earlier as `optimal_int`)
+all_bitstrings = [f"{k:0{n_wires}b}" for k in range(2 ** n_wires)]
+x_all = np.arange(2 ** n_wires)
+
+
+def plot_freq_histogram(ax, freqs, title, bar_color):
+    bar_colors = [
+        "#39ff14" if k == optimal_int else bar_color for k in range(2 ** n_wires)
+    ]
+    ax.bar(x_all, freqs, color=bar_colors)
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("bitstrings")
+    ax.set_ylabel("freq.")
+    ax.set_xticks(x_all)
+    ax.set_xticklabels(all_bitstrings, rotation=90, fontsize=7)
+
+
+plot_freq_histogram(axs[1, 2], qaoa_freqs, "QAOA Samples\n(optimal in green)", "#00f5ff")
+plot_freq_histogram(axs[1, 3], vqe_freqs, "VQE Samples\n(optimal in green)", "#ff9f43")
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.savefig("dashboard.png", dpi=150, facecolor=fig.get_facecolor())
+print("Saved: dashboard.png")
+
+plt.show()
+
+
+
+
+
+
+    
