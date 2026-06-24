@@ -22,4 +22,5 @@ Finding the exact global maximum for a weighted Max-Cut problem is classically N
 
 Variational Quantum Algorithms (VQAs) map the discrete problem onto a continuous landscape of quantum parameters. By leveraging Quantum Superposition and Entanglement, algorithms like QAOA and VQE can evaluate entire solution spaces simultaneously, providing a robust near-term (NISQ-era) framework to tackle combinatorial optimization without hitting classical exponential scaling bottlenecks
 
+Project Report : [click here](./report_AQC_Hackathon.docx)
 
